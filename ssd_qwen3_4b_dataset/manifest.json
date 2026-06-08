@@ -1,0 +1,38 @@
+{
+  "counts": {
+    "accepted_records": 23,
+    "failures_logged": 0,
+    "failures_this_run": 0,
+    "filtered_this_run": 0,
+    "finalized_filtered_or_context_skips": 0,
+    "generated_this_run": 23,
+    "input_rows": 8343,
+    "pending_unique_candidates": 6795,
+    "skipped_duplicate_problem_statement": 1518,
+    "skipped_empty_problem_statement": 7,
+    "unique_nonempty_candidates": 6818
+  },
+  "created_or_updated_at": "2026-06-07T00:39:08.740947+00:00",
+  "files": {
+    "progress_state": "progress_state.json",
+    "records": "records.jsonl",
+    "sft_messages": "sft_messages.jsonl",
+    "skipped_rows": "skipped_rows.jsonl"
+  },
+  "input_csv": "data 2.csv",
+  "model_path": "/Users/aayanarish/models/Qwen3-4B-4bit",
+  "output_dir": "ssd_qwen3_4b_dataset",
+  "run_started_at": "2026-06-06T20:52:13.801650+00:00",
+  "settings": {
+    "max_context_tokens": 32768,
+    "no_code_execution": true,
+    "no_correctness_verification": true,
+    "paper_minimal_filtering": true,
+    "samples_per_prompt": 1,
+    "seed": null,
+    "system_prompt": "You are an expert competitive programmer. Solve the problem in Python and provide the final answer as a markdown code block.",
+    "temperature": 1.6,
+    "top_k": 20,
+    "top_p": 0.8
+  }
+}
