@@ -1,10 +1,9 @@
 # Qwen3-4B SSD Dataset Generation
 
-This repository prepares a simple self-distillation (SSD) dataset for a local
-Qwen3-4B model. It starts from the Hugging Face
-`livecodebench/code_generation_lite` dataset, asks the same local Qwen3-4B
-model to generate one Python solution per unique prompt, and writes chat-format
-JSONL that can be used for supervised fine-tuning.
+This repository prepares a simple self-distillation (SSD) dataset for Qwen3-4B.
+It starts from the Hugging Face `livecodebench/code_generation_lite` dataset,
+asks Qwen3-4B to generate one Python solution per unique prompt, and writes
+chat-format JSONL that can be used for supervised fine-tuning.
 
 The implementation follows the dataset-generation portion of the SSD paper's
 recipe: sample raw model outputs, avoid correctness verification, avoid code
@@ -12,7 +11,7 @@ execution, and apply only minimal degeneracy filtering.
 
 ## Repository Contents
 
-- `generate_ssd_dataset.py` - resumable MLX generation script.
+- `generate_ssd_dataset.py` - resumable MLX/vLLM generation script.
 - `ssd_qwen3_4b_lcb_dataset/` - output handoff folder for generated records,
   manifests, and skipped-row logs.
 - `old_data_gen/` - previous CSV-based source and generated-data artifacts,
@@ -23,8 +22,12 @@ Local smoke-test outputs and Python caches are intentionally ignored by Git.
 
 ## Requirements
 
-This project expects a macOS Apple Silicon environment with MLX available and a
-local MLX-format Qwen3-4B model at:
+The script supports two generation backends:
+
+- `mlx` for macOS Apple Silicon with MLX.
+- `vllm` for Linux CUDA machines such as an NVIDIA A100 or RTX A5000.
+
+On this Mac, the default MLX-format Qwen3-4B model is:
 
 ```text
 /Users/aayanarish/models/Qwen3-4B-4bit
@@ -36,9 +39,15 @@ The tested Python interpreter is:
 /Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10
 ```
 
-Required Python packages include `mlx`, `mlx-lm`, `transformers`, and their
-dependencies. MLX needs access to Metal, so generation may fail in headless or
-sandboxed shells that cannot see the GPU.
+Required Mac packages include `mlx`, `mlx-lm`, `transformers`, `datasets`, and
+their dependencies. MLX needs access to Metal, so generation may fail in
+headless or sandboxed shells that cannot see the GPU.
+
+For CUDA generation, use Linux with Python 3.10 and install CUDA-compatible
+`vllm`, `datasets`, and `transformers`. Use a Hugging Face-format Qwen3-4B model
+folder or model id. The local MLX 4-bit folder above will not run on CUDA GPUs.
+Use the official vLLM GPU installation notes for the current CUDA wheel command:
+<https://docs.vllm.ai/en/latest/getting_started/installation/gpu/>.
 
 ## Prompt Source
 
@@ -54,12 +63,20 @@ which LiveCodeBench requires for its dataset loader. Each prompt uses
 Python block. Public and private test cases are kept out of the prompt and are
 not used for filtering.
 
+LiveCodeBench shards such as `test.jsonl`, `test2.jsonl`, and `test3.jsonl` are
+downloaded by Hugging Face `datasets` into the machine's HF cache, not into this
+repository. Set `HF_HOME` before running if you want that cache on a specific
+disk.
+
 ## Generation Recipe
 
 The default script settings are:
 
-- model: `/Users/aayanarish/models/Qwen3-4B-4bit`
+- backend: `auto` (`mlx` on macOS, `vllm` elsewhere)
+- Mac model: `/Users/aayanarish/models/Qwen3-4B-4bit`
+- CUDA model: explicit `--model /path/to/HF-format-Qwen3-4B`
 - samples per prompt: `1`
+- accepted-record chunk size: `100`
 - context cap: `32768` prompt + output tokens
 - temperature: `1.6`
 - top-k: `20`
@@ -77,42 +94,68 @@ From the repository root, prepare the output folder and manifests without loadin
 the model:
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --prepare-only
+/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --backend mlx --prepare-only
 ```
 
-Run a small smoke test:
+Run a small Mac/MLX smoke test:
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --output-dir ssd_qwen3_4b_dataset_dryrun --stop-after 3 --max-context-tokens 2048 --seed 1
+/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --backend mlx --output-dir ssd_qwen3_4b_dataset_dryrun --stop-after 3 --max-context-tokens 2048 --seed 1
 ```
 
-Run the full generation job:
+Run the full Mac/MLX generation job:
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py
+/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --backend mlx
 ```
 
-The job is append-only and resumable. If it is interrupted, rerun the same
-command; completed record IDs are skipped.
+Run a small CUDA/vLLM smoke test:
+
+```bash
+python3.10 generate_ssd_dataset.py \
+  --backend vllm \
+  --model /path/to/HF-format-Qwen3-4B \
+  --output-dir ssd_qwen3_4b_lcb_dataset_cuda_dryrun \
+  --stop-after 3 \
+  --max-context-tokens 2048
+```
+
+Run the full CUDA/vLLM generation job:
+
+```bash
+python3.10 generate_ssd_dataset.py \
+  --backend vllm \
+  --model /path/to/HF-format-Qwen3-4B \
+  --output-dir ssd_qwen3_4b_lcb_dataset_cuda
+```
+
+The job is append-only and resumable. Accepted records are fsynced one at a time
+and grouped into chunk files containing 100 accepted records by default. If the
+job is interrupted, rerun the same command; completed record IDs are discovered
+from existing chunks and skipped.
 
 Validate an output folder:
 
 ```bash
-/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --validate-only
+/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10 generate_ssd_dataset.py --backend mlx --validate-only
 ```
 
 ## Output Files
 
 The main output folder is `ssd_qwen3_4b_lcb_dataset/`.
 
-- `records.jsonl` - full records with source metadata, chat messages, token
-  counts, finish reason, elapsed time, and generation settings.
-- `sft_messages.jsonl` - minimal SFT records containing only `messages`.
+- `records/records_*.jsonl` - chunked full records with source metadata, chat
+  messages, token counts, finish reason, elapsed time, and generation settings.
+- `sft_messages/sft_messages_*.jsonl` - chunked minimal SFT records containing
+  only `messages`.
 - `skipped_rows.jsonl` - empty rows, duplicate mappings, filtered generations,
   context-budget skips, and generation failures.
 - `manifest.json` - current counts, paths, and generation settings.
 - `progress_state.json` - last checkpoint status for long runs.
 - `README.md` - output-folder-specific handoff notes.
+
+Older output folders with root-level `records.jsonl` and `sft_messages.jsonl`
+are still supported for validation and resume.
 
 Each accepted SFT record has three chat messages:
 

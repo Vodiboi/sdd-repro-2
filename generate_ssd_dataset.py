@@ -7,19 +7,21 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 DEFAULT_DATASET_NAME = "livecodebench/code_generation_lite"
 DEFAULT_DATASET_SPLIT = "test"
 DEFAULT_OUTPUT_DIR = Path("ssd_qwen3_4b_lcb_dataset")
-DEFAULT_MODEL_PATH = Path("/Users/aayanarish/models/Qwen3-4B-4bit")
+DEFAULT_MLX_MODEL = "/Users/aayanarish/models/Qwen3-4B-4bit"
+DEFAULT_CHUNK_SIZE = 100
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert competitive programmer. Solve the problem in Python "
     "and provide the final answer as a markdown code block."
@@ -64,6 +66,27 @@ class Candidate:
     prompt_sha256: str
     source_metadata: dict[str, Any]
     duplicate_source_indices: list[int]
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    text: str
+    finish_reason: str | None
+    token_counts: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class GenerationBackend:
+    name: str
+    model: str
+    tokenizer: Any
+    generate: Callable[[str, int], GenerationResult]
+
+
+@dataclass(frozen=True)
+class ChunkState:
+    index: int
+    record_count: int
 
 
 def build_lcb_prompt(row: dict[str, Any]) -> str:
@@ -182,12 +205,100 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 raise ValueError(f"Invalid JSON in {path} line {line_number}: {exc}") from exc
 
 
-def read_completed_ids(records_path: Path) -> set[str]:
+def chunk_path(output_dir: Path, directory_name: str, prefix: str, index: int) -> Path:
+    return output_dir / directory_name / f"{prefix}_{index:06d}.jsonl"
+
+
+def chunk_indices(output_dir: Path, directory_name: str, prefix: str) -> list[int]:
+    directory = output_dir / directory_name
+    if not directory.exists():
+        return []
+
+    indices: list[int] = []
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.jsonl$")
+    for path in directory.glob(f"{prefix}_*.jsonl"):
+        match = pattern.match(path.name)
+        if match:
+            indices.append(int(match.group(1)))
+    return sorted(indices)
+
+
+def output_jsonl_files(
+    output_dir: Path,
+    *,
+    legacy_name: str,
+    directory_name: str,
+    prefix: str,
+) -> list[Path]:
+    files: list[Path] = []
+    legacy_path = output_dir / legacy_name
+    if legacy_path.exists():
+        files.append(legacy_path)
+    for index in chunk_indices(output_dir, directory_name, prefix):
+        files.append(chunk_path(output_dir, directory_name, prefix, index))
+    return files
+
+
+def record_files(output_dir: Path) -> list[Path]:
+    return output_jsonl_files(
+        output_dir,
+        legacy_name="records.jsonl",
+        directory_name="records",
+        prefix="records",
+    )
+
+
+def sft_files(output_dir: Path) -> list[Path]:
+    return output_jsonl_files(
+        output_dir,
+        legacy_name="sft_messages.jsonl",
+        directory_name="sft_messages",
+        prefix="sft_messages",
+    )
+
+
+def count_jsonl_records(path: Path) -> int:
+    return sum(1 for _ in iter_jsonl(path))
+
+
+def next_chunk_state(output_dir: Path, chunk_size: int) -> ChunkState:
+    if chunk_size <= 0:
+        raise ValueError("--chunk-size must be a positive integer")
+
+    indices = chunk_indices(output_dir, "records", "records")
+    if not indices:
+        return ChunkState(index=1, record_count=0)
+
+    last_index = indices[-1]
+    last_count = count_jsonl_records(chunk_path(output_dir, "records", "records", last_index))
+    if last_count >= chunk_size:
+        return ChunkState(index=last_index + 1, record_count=0)
+    return ChunkState(index=last_index, record_count=last_count)
+
+
+def write_accepted_chunk(
+    output_dir: Path,
+    chunk_index: int,
+    record: dict[str, Any],
+    sft_record: dict[str, Any],
+) -> None:
+    records_path = chunk_path(output_dir, "records", "records", chunk_index)
+    sft_path = chunk_path(output_dir, "sft_messages", "sft_messages", chunk_index)
+    records_path.parent.mkdir(parents=True, exist_ok=True)
+    sft_path.parent.mkdir(parents=True, exist_ok=True)
+    with records_path.open("a", encoding="utf-8") as records_handle:
+        json_dump_line(records_handle, record)
+    with sft_path.open("a", encoding="utf-8") as sft_handle:
+        json_dump_line(sft_handle, sft_record)
+
+
+def read_completed_ids(output_dir: Path) -> set[str]:
     ids: set[str] = set()
-    for record in iter_jsonl(records_path):
-        record_id = record.get("id")
-        if record_id:
-            ids.add(record_id)
+    for path in record_files(output_dir):
+        for record in iter_jsonl(path):
+            record_id = record.get("id")
+            if record_id:
+                ids.add(record_id)
     return ids
 
 
@@ -228,6 +339,136 @@ def encode_len(tokenizer: Any, text: str) -> int:
         return len(tokenizer.encode(text, add_special_tokens=False))
     except TypeError:
         return len(tokenizer.encode(text))
+
+
+def resolve_backend(requested_backend: str) -> str:
+    if requested_backend != "auto":
+        return requested_backend
+    if platform.system() == "Darwin":
+        return "mlx"
+    return "vllm"
+
+
+def normalize_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.requested_backend = args.backend
+    args.backend = resolve_backend(args.backend)
+
+    if args.model is None:
+        if args.backend == "mlx":
+            args.model = DEFAULT_MLX_MODEL
+        else:
+            raise ValueError(
+                "A vLLM run needs an explicit HF-format model path or model id. "
+                "Pass --model /path/to/HF-format-Qwen3-4B."
+            )
+
+    if args.backend == "vllm" and str(args.model) == DEFAULT_MLX_MODEL:
+        raise ValueError(
+            f"{DEFAULT_MLX_MODEL} is an MLX-format model and cannot run on an A100. "
+            "Pass --model pointing at a Hugging Face-format Qwen3-4B directory."
+        )
+
+    return args
+
+
+def load_mlx_backend(args: argparse.Namespace) -> GenerationBackend:
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_sampler
+    import mlx.core as mx
+
+    if args.seed is not None:
+        mx.random.seed(args.seed)
+
+    model, tokenizer = load(str(args.model))
+    sampler = make_sampler(temp=args.temperature, top_p=args.top_p, top_k=args.top_k)
+
+    def generate(prompt: str, max_new_tokens: int) -> GenerationResult:
+        output_text = ""
+        generation_tokens = 0
+        finish_reason = None
+        for response in stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=max_new_tokens,
+            sampler=sampler,
+        ):
+            output_text += response.text
+            generation_tokens = response.generation_tokens
+            finish_reason = response.finish_reason
+        return GenerationResult(
+            text=output_text,
+            finish_reason=finish_reason,
+            token_counts={"generation_tokens_reported_by_mlx": generation_tokens},
+        )
+
+    return GenerationBackend(
+        name="mlx",
+        model=str(args.model),
+        tokenizer=tokenizer,
+        generate=generate,
+    )
+
+
+def load_vllm_backend(args: argparse.Namespace) -> GenerationBackend:
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=str(args.model),
+        trust_remote_code=args.model_trust_remote_code,
+        dtype=args.vllm_dtype,
+        max_model_len=args.max_context_tokens,
+        tensor_parallel_size=args.vllm_tensor_parallel_size,
+        gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+    )
+    tokenizer = llm.get_tokenizer()
+
+    def make_sampling_params(max_new_tokens: int) -> Any:
+        kwargs: dict[str, Any] = {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "max_tokens": max_new_tokens,
+        }
+        if args.seed is not None:
+            kwargs["seed"] = args.seed
+        try:
+            return SamplingParams(**kwargs)
+        except TypeError:
+            kwargs.pop("seed", None)
+            return SamplingParams(**kwargs)
+
+    def generate(prompt: str, max_new_tokens: int) -> GenerationResult:
+        outputs = llm.generate([prompt], make_sampling_params(max_new_tokens))
+        if not outputs or not outputs[0].outputs:
+            return GenerationResult(
+                text="",
+                finish_reason=None,
+                token_counts={"generation_tokens_reported_by_vllm": 0},
+            )
+        completion = outputs[0].outputs[0]
+        token_ids = getattr(completion, "token_ids", None)
+        generation_tokens = len(token_ids) if token_ids is not None else None
+        return GenerationResult(
+            text=completion.text,
+            finish_reason=getattr(completion, "finish_reason", None),
+            token_counts={"generation_tokens_reported_by_vllm": generation_tokens},
+        )
+
+    return GenerationBackend(
+        name="vllm",
+        model=str(args.model),
+        tokenizer=tokenizer,
+        generate=generate,
+    )
+
+
+def load_generation_backend(args: argparse.Namespace) -> GenerationBackend:
+    if args.backend == "mlx":
+        return load_mlx_backend(args)
+    if args.backend == "vllm":
+        return load_vllm_backend(args)
+    raise ValueError(f"Unsupported backend: {args.backend}")
 
 
 def write_static_skips(
@@ -273,7 +514,9 @@ def make_manifest(
         "source_dataset": args.dataset_name,
         "source_split": args.dataset_split,
         "output_dir": str(args.output_dir),
-        "model_path": str(args.model_path),
+        "backend": args.backend,
+        "requested_backend": args.requested_backend,
+        "model": str(args.model),
         "counts": {
             "source_rows": total_rows,
             "unique_nonempty_prompts": len(candidates),
@@ -289,6 +532,7 @@ def make_manifest(
         },
         "settings": {
             "samples_per_prompt": 1,
+            "chunk_size": args.chunk_size,
             "max_context_tokens": args.max_context_tokens,
             "temperature": args.temperature,
             "top_k": args.top_k,
@@ -298,10 +542,16 @@ def make_manifest(
             "no_correctness_verification": True,
             "no_code_execution": True,
             "seed": args.seed,
+            "model_trust_remote_code": args.model_trust_remote_code,
+            "vllm_dtype": args.vllm_dtype,
+            "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+            "vllm_gpu_memory_utilization": args.vllm_gpu_memory_utilization,
         },
         "files": {
-            "records": "records.jsonl",
-            "sft_messages": "sft_messages.jsonl",
+            "records": "records/records_*.jsonl",
+            "sft_messages": "sft_messages/sft_messages_*.jsonl",
+            "legacy_records": "records.jsonl",
+            "legacy_sft_messages": "sft_messages.jsonl",
             "skipped_rows": "skipped_rows.jsonl",
             "progress_state": "progress_state.json",
         },
@@ -309,37 +559,39 @@ def make_manifest(
 
 
 def validate_outputs(output_dir: Path, total_rows: int | None = None) -> dict[str, Any]:
-    records_path = output_dir / "records.jsonl"
-    sft_path = output_dir / "sft_messages.jsonl"
     skipped_path = output_dir / "skipped_rows.jsonl"
+    records_paths = record_files(output_dir)
+    sft_paths = sft_files(output_dir)
 
     record_ids: set[str] = set()
     max_total_tokens = 0
     record_count = 0
-    for record in iter_jsonl(records_path):
-        record_count += 1
-        record_id = record.get("id")
-        if not record_id:
-            raise ValueError(f"{records_path} has a record without id")
-        if record_id in record_ids:
-            raise ValueError(f"{records_path} has duplicate id {record_id}")
-        record_ids.add(record_id)
-        messages = record.get("messages", [])
-        roles = [message.get("role") for message in messages]
-        if roles != ["system", "user", "assistant"]:
-            raise ValueError(f"{record_id} messages roles are {roles}, expected system/user/assistant")
-        total_tokens = record.get("token_counts", {}).get("total_tokens", 0)
-        max_total_tokens = max(max_total_tokens, total_tokens)
-        if total_tokens > record.get("generation_settings", {}).get("max_context_tokens", 32768):
-            raise ValueError(f"{record_id} exceeds context window: {total_tokens}")
+    for path in records_paths:
+        for record in iter_jsonl(path):
+            record_count += 1
+            record_id = record.get("id")
+            if not record_id:
+                raise ValueError(f"{path} has a record without id")
+            if record_id in record_ids:
+                raise ValueError(f"{path} has duplicate id {record_id}")
+            record_ids.add(record_id)
+            messages = record.get("messages", [])
+            roles = [message.get("role") for message in messages]
+            if roles != ["system", "user", "assistant"]:
+                raise ValueError(f"{record_id} messages roles are {roles}, expected system/user/assistant")
+            total_tokens = record.get("token_counts", {}).get("total_tokens", 0)
+            max_total_tokens = max(max_total_tokens, total_tokens)
+            if total_tokens > record.get("generation_settings", {}).get("max_context_tokens", 32768):
+                raise ValueError(f"{record_id} exceeds context window: {total_tokens}")
 
     sft_count = 0
-    for record in iter_jsonl(sft_path):
-        sft_count += 1
-        messages = record.get("messages", [])
-        roles = [message.get("role") for message in messages]
-        if roles != ["system", "user", "assistant"]:
-            raise ValueError(f"{sft_path} line {sft_count} roles are {roles}")
+    for path in sft_paths:
+        for record in iter_jsonl(path):
+            sft_count += 1
+            messages = record.get("messages", [])
+            roles = [message.get("role") for message in messages]
+            if roles != ["system", "user", "assistant"]:
+                raise ValueError(f"{path} line {sft_count} roles are {roles}")
 
     if sft_count != record_count:
         raise ValueError(f"record count {record_count} != SFT count {sft_count}")
@@ -351,7 +603,9 @@ def validate_outputs(output_dir: Path, total_rows: int | None = None) -> dict[st
 
     return {
         "records": record_count,
+        "record_files": [str(path) for path in records_paths],
         "sft_messages": sft_count,
+        "sft_message_files": [str(path) for path in sft_paths],
         "skipped_rows": skip_count,
         "max_total_tokens": max_total_tokens,
         "reconciles_to_source_rows": reconciled,
@@ -359,21 +613,24 @@ def validate_outputs(output_dir: Path, total_rows: int | None = None) -> dict[st
 
 
 def run_generation(args: argparse.Namespace) -> None:
+    args = normalize_runtime_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    records_path = args.output_dir / "records.jsonl"
-    sft_path = args.output_dir / "sft_messages.jsonl"
+    (args.output_dir / "records").mkdir(exist_ok=True)
+    (args.output_dir / "sft_messages").mkdir(exist_ok=True)
     skipped_path = args.output_dir / "skipped_rows.jsonl"
     manifest_path = args.output_dir / "manifest.json"
     progress_path = args.output_dir / "progress_state.json"
 
-    for jsonl_path in (records_path, sft_path, skipped_path):
-        jsonl_path.touch(exist_ok=True)
+    skipped_path.touch(exist_ok=True)
 
     candidates, static_skips, total_rows = read_candidates(args)
-    completed_ids = read_completed_ids(records_path)
+    completed_ids = read_completed_ids(args.output_dir)
     existing_skip_keys, finalized_skipped_ids, skipped_reason_counts = read_skip_keys(skipped_path)
     write_static_skips(skipped_path, static_skips, existing_skip_keys)
     existing_skip_keys, finalized_skipped_ids, skipped_reason_counts = read_skip_keys(skipped_path)
+    chunk_state = next_chunk_state(args.output_dir, args.chunk_size)
+    current_chunk_index = chunk_state.index
+    current_chunk_record_count = chunk_state.record_count
 
     started_at = utc_now()
     generated_this_run = 0
@@ -398,23 +655,23 @@ def run_generation(args: argparse.Namespace) -> None:
             started_at=started_at,
         )
         atomic_write_json(manifest_path, manifest)
-        atomic_write_json(progress_path, {"updated_at": utc_now(), "status": "prepared"})
+        atomic_write_json(
+            progress_path,
+            {
+                "updated_at": utc_now(),
+                "status": "prepared",
+                "accepted_records": len(completed_ids),
+                "current_chunk_index": current_chunk_index,
+                "current_chunk_record_count": current_chunk_record_count,
+            },
+        )
         print(f"Prepared {args.output_dir} without loading the model.")
         return
 
-    from mlx_lm import load, stream_generate
-    from mlx_lm.sample_utils import make_sampler
-    import mlx.core as mx
+    backend = load_generation_backend(args)
+    tokenizer = backend.tokenizer
 
-    if args.seed is not None:
-        mx.random.seed(args.seed)
-
-    model, tokenizer = load(str(args.model_path))
-    sampler = make_sampler(temp=args.temperature, top_p=args.top_p, top_k=args.top_k)
-
-    with records_path.open("a", encoding="utf-8") as records_handle, sft_path.open(
-        "a", encoding="utf-8"
-    ) as sft_handle, skipped_path.open("a", encoding="utf-8") as skipped_handle:
+    with skipped_path.open("a", encoding="utf-8") as skipped_handle:
         for candidate in candidates:
             if args.stop_after is not None and generated_this_run >= args.stop_after:
                 break
@@ -449,20 +706,8 @@ def run_generation(args: argparse.Namespace) -> None:
             )
 
             start = time.time()
-            output_text = ""
-            generation_tokens = 0
-            finish_reason = None
             try:
-                for response in stream_generate(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_tokens=max_new_tokens,
-                    sampler=sampler,
-                ):
-                    output_text += response.text
-                    generation_tokens = response.generation_tokens
-                    finish_reason = response.finish_reason
+                generation = backend.generate(prompt, max_new_tokens)
             except Exception as exc:  # Keep the long run moving.
                 failures_this_run += 1
                 skip = {
@@ -478,7 +723,7 @@ def run_generation(args: argparse.Namespace) -> None:
                 json_dump_line(skipped_handle, skip)
                 continue
 
-            output_text = output_text.strip()
+            output_text = generation.text.strip()
             output_tokens = encode_len(tokenizer, output_text)
             total_tokens = prompt_tokens + output_tokens
 
@@ -508,7 +753,8 @@ def run_generation(args: argparse.Namespace) -> None:
 
             full_messages = messages + [{"role": "assistant", "content": output_text}]
             generation_settings = {
-                "model_path": str(args.model_path),
+                "backend": backend.name,
+                "model": backend.model,
                 "temperature": args.temperature,
                 "top_k": args.top_k,
                 "top_p": args.top_p,
@@ -530,16 +776,37 @@ def run_generation(args: argparse.Namespace) -> None:
                     "prompt_tokens": prompt_tokens,
                     "output_tokens": output_tokens,
                     "total_tokens": total_tokens,
-                    "generation_tokens_reported_by_mlx": generation_tokens,
+                    **generation.token_counts,
                 },
                 "generation_settings": generation_settings,
-                "finish_reason": finish_reason,
+                "finish_reason": generation.finish_reason,
                 "elapsed_seconds": round(time.time() - start, 3),
             }
-            json_dump_line(records_handle, record)
-            json_dump_line(sft_handle, {"messages": full_messages})
+            write_accepted_chunk(
+                args.output_dir,
+                current_chunk_index,
+                record,
+                {"messages": full_messages},
+            )
             completed_ids.add(candidate.id)
             generated_this_run += 1
+            current_chunk_record_count += 1
+            if current_chunk_record_count >= args.chunk_size:
+                current_chunk_index += 1
+                current_chunk_record_count = 0
+
+            atomic_write_json(
+                progress_path,
+                {
+                    "updated_at": utc_now(),
+                    "status": "running",
+                    "last_completed_id": candidate.id,
+                    "accepted_records": len(completed_ids),
+                    "generated_this_run": generated_this_run,
+                    "current_chunk_index": current_chunk_index,
+                    "current_chunk_record_count": current_chunk_record_count,
+                },
+            )
 
             if generated_this_run % args.checkpoint_every == 0:
                 existing_skip_keys, finalized_skipped_ids, skipped_reason_counts = read_skip_keys(skipped_path)
@@ -562,7 +829,10 @@ def run_generation(args: argparse.Namespace) -> None:
                         "updated_at": utc_now(),
                         "status": "running",
                         "last_completed_id": candidate.id,
+                        "accepted_records": len(completed_ids),
                         "generated_this_run": generated_this_run,
+                        "current_chunk_index": current_chunk_index,
+                        "current_chunk_record_count": current_chunk_record_count,
                     },
                 )
 
@@ -588,6 +858,9 @@ def run_generation(args: argparse.Namespace) -> None:
             "generated_this_run": generated_this_run,
             "filtered_this_run": filtered_this_run,
             "failures_this_run": failures_this_run,
+            "accepted_records": len(completed_ids),
+            "current_chunk_index": current_chunk_index,
+            "current_chunk_record_count": current_chunk_record_count,
         },
     )
     print(json.dumps(manifest["counts"], indent=2, sort_keys=True))
@@ -604,13 +877,61 @@ def parse_args() -> argparse.Namespace:
         help="Allow the LiveCodeBench dataset loading script to run.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "mlx", "vllm"),
+        default="auto",
+        help="Generation backend. auto uses MLX on macOS and vLLM elsewhere.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model path or Hugging Face model id. Defaults to the local MLX "
+            "Qwen3-4B path when using the MLX backend."
+        ),
+    )
+    parser.add_argument(
+        "--model-path",
+        dest="model",
+        default=None,
+        help="Deprecated alias for --model.",
+    )
+    parser.add_argument(
+        "--model-trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow custom model code when loading the generation model.",
+    )
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--max-context-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.6)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Accepted records per records/sft_messages chunk file.",
+    )
+    parser.add_argument(
+        "--vllm-dtype",
+        default="auto",
+        help="vLLM dtype passed to LLM(...). Ignored by the MLX backend.",
+    )
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="vLLM tensor parallel size. Use 1 for one A100.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory vLLM may use. Ignored by the MLX backend.",
+    )
     parser.add_argument(
         "--stop-after",
         type=int,
