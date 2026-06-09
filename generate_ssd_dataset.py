@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Generate a Qwen3-4B simple self-distillation dataset from data 2.csv."""
+"""Generate a Qwen3-4B simple self-distillation dataset from LiveCodeBench."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -17,8 +16,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_INPUT = Path("data 2.csv")
-DEFAULT_OUTPUT_DIR = Path("ssd_qwen3_4b_dataset")
+DEFAULT_DATASET_NAME = "livecodebench/code_generation_lite"
+DEFAULT_DATASET_SPLIT = "test"
+DEFAULT_OUTPUT_DIR = Path("ssd_qwen3_4b_lcb_dataset")
 DEFAULT_MODEL_PATH = Path("/Users/aayanarish/models/Qwen3-4B-4bit")
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert competitive programmer. Solve the problem in Python "
@@ -58,89 +58,113 @@ def is_single_line_stub(text: str) -> bool:
 @dataclass(frozen=True)
 class Candidate:
     id: str
-    source_row_index: int
-    contest: str
-    problem_name: str
-    problem_statement: str
-    problem_tags: str
-    normalized_statement: str
-    statement_sha256: str
-    duplicate_source_row_indices: list[int]
+    source_index: int
+    prompt_text: str
+    normalized_prompt: str
+    prompt_sha256: str
+    source_metadata: dict[str, Any]
+    duplicate_source_indices: list[int]
 
 
-def read_candidates(input_path: Path) -> tuple[list[Candidate], list[dict[str, Any]], int]:
+def build_lcb_prompt(row: dict[str, Any]) -> str:
+    question_content = row.get("question_content") or ""
+    starter_code = (row.get("starter_code") or "").strip()
+    if not starter_code:
+        return question_content
+    return (
+        question_content.rstrip()
+        + "\n\nStarter code:\n```python\n"
+        + starter_code
+        + "\n```"
+    )
+
+
+def livecodebench_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    public_test_cases = row.get("public_test_cases")
+    private_test_cases = row.get("private_test_cases")
+    return {
+        "dataset": DEFAULT_DATASET_NAME,
+        "question_title": row.get("question_title", ""),
+        "question_id": row.get("question_id", ""),
+        "platform": row.get("platform", ""),
+        "contest_id": row.get("contest_id", ""),
+        "contest_date": row.get("contest_date", ""),
+        "difficulty": row.get("difficulty", ""),
+        "metadata": row.get("metadata", ""),
+        "has_starter_code": bool((row.get("starter_code") or "").strip()),
+        "has_public_test_cases": bool(public_test_cases),
+        "has_private_test_cases": bool(private_test_cases),
+    }
+
+
+def read_candidates(args: argparse.Namespace) -> tuple[list[Candidate], list[dict[str, Any]], int]:
+    from datasets import load_dataset
+
     candidates: list[Candidate] = []
     skipped: list[dict[str, Any]] = []
     seen: dict[str, Candidate] = {}
     total_rows = 0
 
-    with input_path.open(newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        required = {"contest", "problem_name", "problem_statement", "problem_tags"}
-        missing = sorted(required - set(reader.fieldnames or []))
-        if missing:
-            raise ValueError(f"{input_path} is missing required columns: {missing}")
+    dataset = load_dataset(
+        args.dataset_name,
+        split=args.dataset_split,
+        trust_remote_code=args.trust_remote_code,
+    )
 
-        for zero_index, row in enumerate(reader):
-            total_rows += 1
-            source_row_index = zero_index + 2  # includes CSV header row
-            statement = row.get("problem_statement", "")
-            normalized = normalize_statement(statement)
-            if not normalized:
-                skipped.append(
-                    {
-                        "_skip_key": f"empty:{source_row_index}",
-                        "reason": "empty_problem_statement",
-                        "source_row_index": source_row_index,
-                        "source": {
-                            "contest": row.get("contest", ""),
-                            "problem_name": row.get("problem_name", ""),
-                            "problem_tags": row.get("problem_tags", ""),
-                        },
-                    }
-                )
-                continue
+    for zero_index, row in enumerate(dataset):
+        total_rows += 1
+        source_index = zero_index
+        prompt_text = build_lcb_prompt(row)
+        normalized = normalize_statement(prompt_text)
+        metadata = livecodebench_metadata(row)
+        metadata["dataset"] = args.dataset_name
+        metadata["split"] = args.dataset_split
 
-            statement_hash = sha256_text(normalized)
-            if statement_hash in seen:
-                original = seen[statement_hash]
-                original.duplicate_source_row_indices.append(source_row_index)
-                skipped.append(
-                    {
-                        "_skip_key": f"duplicate:{source_row_index}:{original.id}",
-                        "reason": "duplicate_problem_statement",
-                        "source_row_index": source_row_index,
-                        "duplicate_of_id": original.id,
-                        "duplicate_of_source_row_index": original.source_row_index,
-                        "source": {
-                            "contest": row.get("contest", ""),
-                            "problem_name": row.get("problem_name", ""),
-                            "problem_tags": row.get("problem_tags", ""),
-                            "problem_statement_sha256": statement_hash,
-                        },
-                    }
-                )
-                continue
-
-            base_id = (
-                f"cf_{row.get('contest', '').strip() or 'unknown'}_"
-                f"{row.get('problem_name', '').strip() or 'unknown'}_"
-                f"{statement_hash[:12]}"
+        if not normalized:
+            skipped.append(
+                {
+                    "_skip_key": f"empty:{source_index}",
+                    "reason": "empty_prompt",
+                    "source_index": source_index,
+                    "source": metadata,
+                }
             )
-            base_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", base_id)
-            candidate = Candidate(
-                id=base_id,
-                source_row_index=source_row_index,
-                contest=row.get("contest", ""),
-                problem_name=row.get("problem_name", ""),
-                problem_statement=statement,
-                problem_tags=row.get("problem_tags", ""),
-                normalized_statement=normalized,
-                statement_sha256=statement_hash,
-                duplicate_source_row_indices=[],
+            continue
+
+        prompt_hash = sha256_text(normalized)
+        if prompt_hash in seen:
+            original = seen[prompt_hash]
+            original.duplicate_source_indices.append(source_index)
+            skipped.append(
+                {
+                    "_skip_key": f"duplicate:{source_index}:{original.id}",
+                    "reason": "duplicate_prompt",
+                    "source_index": source_index,
+                    "duplicate_of_id": original.id,
+                    "duplicate_of_source_index": original.source_index,
+                    "source": {
+                        **metadata,
+                        "prompt_sha256": prompt_hash,
+                    },
+                }
             )
-            seen[statement_hash] = candidate
-            candidates.append(candidate)
+            continue
+
+        question_id = str(row.get("question_id") or f"row_{source_index}")
+        title = str(row.get("question_title") or "untitled")
+        base_id = f"lcb_{question_id}_{title}_{prompt_hash[:12]}"
+        base_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", base_id).strip("_")
+        candidate = Candidate(
+            id=base_id,
+            source_index=source_index,
+            prompt_text=prompt_text,
+            normalized_prompt=normalized,
+            prompt_sha256=prompt_hash,
+            source_metadata=metadata,
+            duplicate_source_indices=[],
+        )
+        seen[prompt_hash] = candidate
+        candidates.append(candidate)
 
     return candidates, skipped, total_rows
 
@@ -184,10 +208,10 @@ def read_skip_keys(skipped_path: Path) -> tuple[set[str], set[str], dict[str, in
     return skip_keys, finalized_ids, reason_counts
 
 
-def build_messages(system_prompt: str, problem_statement: str) -> list[dict[str, str]]:
+def build_messages(system_prompt: str, prompt_text: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": problem_statement},
+        {"role": "user", "content": prompt_text},
     ]
 
 
@@ -238,24 +262,25 @@ def make_manifest(
     generated_this_run: int,
     started_at: str,
 ) -> dict[str, Any]:
-    static_empty = skipped_reason_counts.get("empty_problem_statement", 0)
-    static_duplicates = skipped_reason_counts.get("duplicate_problem_statement", 0)
+    static_empty = skipped_reason_counts.get("empty_prompt", 0)
+    static_duplicates = skipped_reason_counts.get("duplicate_prompt", 0)
     accepted = len(completed_ids)
     finalized_without_record = len(finalized_skipped_ids - completed_ids)
     pending = max(0, len(candidates) - accepted - finalized_without_record)
     return {
         "created_or_updated_at": utc_now(),
         "run_started_at": started_at,
-        "input_csv": str(args.input),
+        "source_dataset": args.dataset_name,
+        "source_split": args.dataset_split,
         "output_dir": str(args.output_dir),
         "model_path": str(args.model_path),
         "counts": {
-            "input_rows": total_rows,
-            "unique_nonempty_candidates": len(candidates),
+            "source_rows": total_rows,
+            "unique_nonempty_prompts": len(candidates),
             "accepted_records": accepted,
-            "pending_unique_candidates": pending,
-            "skipped_empty_problem_statement": static_empty,
-            "skipped_duplicate_problem_statement": static_duplicates,
+            "pending_unique_prompts": pending,
+            "skipped_empty_prompt": static_empty,
+            "skipped_duplicate_prompt": static_duplicates,
             "finalized_filtered_or_context_skips": finalized_without_record,
             "failures_logged": skipped_reason_counts.get("generation_exception", 0),
             "generated_this_run": generated_this_run,
@@ -329,7 +354,7 @@ def validate_outputs(output_dir: Path, total_rows: int | None = None) -> dict[st
         "sft_messages": sft_count,
         "skipped_rows": skip_count,
         "max_total_tokens": max_total_tokens,
-        "reconciles_to_input_rows": reconciled,
+        "reconciles_to_source_rows": reconciled,
     }
 
 
@@ -344,7 +369,7 @@ def run_generation(args: argparse.Namespace) -> None:
     for jsonl_path in (records_path, sft_path, skipped_path):
         jsonl_path.touch(exist_ok=True)
 
-    candidates, static_skips, total_rows = read_candidates(args.input)
+    candidates, static_skips, total_rows = read_candidates(args)
     completed_ids = read_completed_ids(records_path)
     existing_skip_keys, finalized_skipped_ids, skipped_reason_counts = read_skip_keys(skipped_path)
     write_static_skips(skipped_path, static_skips, existing_skip_keys)
@@ -396,7 +421,7 @@ def run_generation(args: argparse.Namespace) -> None:
             if candidate.id in completed_ids or candidate.id in finalized_skipped_ids:
                 continue
 
-            messages = build_messages(args.system_prompt, candidate.problem_statement)
+            messages = build_messages(args.system_prompt, candidate.prompt_text)
             prompt = apply_chat_template(tokenizer, messages)
             prompt_tokens = encode_len(tokenizer, prompt)
             max_new_tokens = args.max_context_tokens - prompt_tokens
@@ -406,7 +431,7 @@ def run_generation(args: argparse.Namespace) -> None:
                     "_skip_key": f"context:{candidate.id}",
                     "id": candidate.id,
                     "reason": "context_budget_exhausted",
-                    "source_row_index": candidate.source_row_index,
+                    "source_index": candidate.source_index,
                     "prompt_tokens": prompt_tokens,
                     "max_context_tokens": args.max_context_tokens,
                     "created_at": utc_now(),
@@ -444,7 +469,8 @@ def run_generation(args: argparse.Namespace) -> None:
                     "_skip_key": f"generation_exception:{candidate.id}:{int(time.time())}",
                     "id": candidate.id,
                     "reason": "generation_exception",
-                    "source_row_index": candidate.source_row_index,
+                    "source_index": candidate.source_index,
+                    "source": candidate.source_metadata,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "created_at": utc_now(),
@@ -462,12 +488,10 @@ def run_generation(args: argparse.Namespace) -> None:
                     "_skip_key": f"{reason}:{candidate.id}",
                     "id": candidate.id,
                     "reason": reason,
-                    "source_row_index": candidate.source_row_index,
+                    "source_index": candidate.source_index,
                     "source": {
-                        "contest": candidate.contest,
-                        "problem_name": candidate.problem_name,
-                        "problem_tags": candidate.problem_tags,
-                        "problem_statement_sha256": candidate.statement_sha256,
+                        **candidate.source_metadata,
+                        "prompt_sha256": candidate.prompt_sha256,
                     },
                     "token_counts": {
                         "prompt_tokens": prompt_tokens,
@@ -496,13 +520,10 @@ def run_generation(args: argparse.Namespace) -> None:
                 "id": candidate.id,
                 "created_at": utc_now(),
                 "source": {
-                    "csv": str(args.input),
-                    "row_index": candidate.source_row_index,
-                    "contest": candidate.contest,
-                    "problem_name": candidate.problem_name,
-                    "problem_tags": candidate.problem_tags,
-                    "problem_statement_sha256": candidate.statement_sha256,
-                    "duplicate_source_row_indices": candidate.duplicate_source_row_indices,
+                    **candidate.source_metadata,
+                    "source_index": candidate.source_index,
+                    "prompt_sha256": candidate.prompt_sha256,
+                    "duplicate_source_indices": candidate.duplicate_source_indices,
                 },
                 "messages": full_messages,
                 "token_counts": {
@@ -574,7 +595,14 @@ def run_generation(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
+    parser.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow the LiveCodeBench dataset loading script to run.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)

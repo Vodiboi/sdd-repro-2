@@ -1,10 +1,10 @@
 # Qwen3-4B SSD Dataset Generation
 
 This repository prepares a simple self-distillation (SSD) dataset for a local
-Qwen3-4B model. It starts from competitive-programming problem statements in
-`data 2.csv`, asks the same local Qwen3-4B model to generate one Python
-solution per unique prompt, and writes chat-format JSONL that can be used for
-supervised fine-tuning.
+Qwen3-4B model. It starts from the Hugging Face
+`livecodebench/code_generation_lite` dataset, asks the same local Qwen3-4B
+model to generate one Python solution per unique prompt, and writes chat-format
+JSONL that can be used for supervised fine-tuning.
 
 The implementation follows the dataset-generation portion of the SSD paper's
 recipe: sample raw model outputs, avoid correctness verification, avoid code
@@ -12,11 +12,11 @@ execution, and apply only minimal degeneracy filtering.
 
 ## Repository Contents
 
-- `data 2.csv` - source problems with `contest`, `problem_name`,
-  `problem_statement`, and `problem_tags`.
 - `generate_ssd_dataset.py` - resumable MLX generation script.
-- `ssd_qwen3_4b_dataset/` - output handoff folder for generated records,
+- `ssd_qwen3_4b_lcb_dataset/` - output handoff folder for generated records,
   manifests, and skipped-row logs.
+- `old_data_gen/` - previous CSV-based source and generated-data artifacts,
+  retained separately from the active LiveCodeBench workflow.
 - `a.ipynb` - small local Qwen/MLX notebook used during setup.
 
 Local smoke-test outputs and Python caches are intentionally ignored by Git.
@@ -40,6 +40,20 @@ Required Python packages include `mlx`, `mlx-lm`, `transformers`, and their
 dependencies. MLX needs access to Metal, so generation may fail in headless or
 sandboxed shells that cannot see the GPU.
 
+## Prompt Source
+
+The active prompt source is:
+
+```text
+livecodebench/code_generation_lite
+```
+
+By default the script loads the `test` split with `trust_remote_code=True`,
+which LiveCodeBench requires for its dataset loader. Each prompt uses
+`question_content`; if `starter_code` is present, it is appended in a fenced
+Python block. Public and private test cases are kept out of the prompt and are
+not used for filtering.
+
 ## Generation Recipe
 
 The default script settings are:
@@ -53,8 +67,8 @@ The default script settings are:
 - filtering: skip empty outputs and single-line stubs only
 - verification: no test execution and no correctness filtering
 
-The CSV is audited before generation. Empty problem statements are skipped, and
-duplicate problem statements are generated only once using whitespace-normalized
+The dataset is audited before generation. Empty prompts are skipped, and
+duplicate prompts are generated only once using whitespace-normalized
 deduplication. Duplicate mappings are written to `skipped_rows.jsonl`.
 
 ## Usage
@@ -89,7 +103,7 @@ Validate an output folder:
 
 ## Output Files
 
-The main output folder is `ssd_qwen3_4b_dataset/`.
+The main output folder is `ssd_qwen3_4b_lcb_dataset/`.
 
 - `records.jsonl` - full records with source metadata, chat messages, token
   counts, finish reason, elapsed time, and generation settings.

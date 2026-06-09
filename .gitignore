@@ -2,5 +2,6 @@
 __pycache__/
 *.py[cod]
 
-# Local smoke-test outputs; the real dataset handoff folder is tracked.
+# Local smoke-test outputs; real dataset handoff folders may be tracked.
 ssd_qwen3_4b_dataset_dryrun/
+ssd_qwen3_4b_lcb_dataset_dryrun/
