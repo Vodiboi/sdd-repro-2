@@ -1,6 +1,7 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+training_outputs/
 
 # Local smoke-test outputs; real dataset handoff folders may be tracked.
 ssd_qwen3_4b_dataset_dryrun/

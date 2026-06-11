@@ -1,0 +1,12 @@
+# Install inside a fresh Linux CUDA virtualenv on the A5000.
+# Unsloth pulls the compatible fine-tuning stack for the active PyTorch/CUDA env.
+unsloth
+datasets
+trl
+accelerate
+bitsandbytes
+huggingface_hub
+sentencepiece
+protobuf
+jupyter
+nbconvert
