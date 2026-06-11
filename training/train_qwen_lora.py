@@ -208,14 +208,14 @@ def make_sft_trainer(
     tokenizer: Any,
     train_dataset: Any,
     eval_dataset: Any,
-    training_args: Any,
+    args: Any,
 ) -> Any:
     parameters = inspect.signature(SFTTrainer.__init__).parameters
     trainer_kwargs = {
         "model": model,
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "args": training_args,
+        "args": args,
     }
     if "tokenizer" in parameters:
         trainer_kwargs["tokenizer"] = tokenizer
