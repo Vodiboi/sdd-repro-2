@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -162,12 +163,73 @@ def add_lora(model: Any, args: argparse.Namespace) -> Any:
     )
 
 
+def make_sft_config(SFTConfig: Any, args: argparse.Namespace) -> Any:
+    parameters = inspect.signature(SFTConfig).parameters
+    requested_kwargs = {
+        "output_dir": str(args.output_dir),
+        "dataset_text_field": "text",
+        "packing": args.packing,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "warmup_steps": args.warmup_steps,
+        "max_steps": args.max_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "optim": args.optim,
+        "weight_decay": args.weight_decay,
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "seed": args.seed,
+        "report_to": args.report_to,
+    }
+
+    if "max_seq_length" in parameters:
+        requested_kwargs["max_seq_length"] = args.max_seq_length
+    elif "max_length" in parameters:
+        requested_kwargs["max_length"] = args.max_seq_length
+
+    config_kwargs = {
+        key: value
+        for key, value in requested_kwargs.items()
+        if key in parameters
+    }
+    skipped = sorted(set(requested_kwargs) - set(config_kwargs))
+    if skipped:
+        print(f"Skipping unsupported SFTConfig args for this TRL version: {skipped}")
+    return SFTConfig(**config_kwargs)
+
+
+def make_sft_trainer(
+    SFTTrainer: Any,
+    *,
+    model: Any,
+    tokenizer: Any,
+    train_dataset: Any,
+    eval_dataset: Any,
+    training_args: Any,
+) -> Any:
+    parameters = inspect.signature(SFTTrainer.__init__).parameters
+    trainer_kwargs = {
+        "model": model,
+        "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
+        "args": training_args,
+    }
+    if "tokenizer" in parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    return SFTTrainer(**trainer_kwargs)
+
+
 def train(args: argparse.Namespace) -> None:
+    from unsloth import FastLanguageModel
+    from unsloth.chat_templates import get_chat_template, standardize_data_formats, train_on_responses_only
     import torch
     from datasets import Dataset
     from trl import SFTConfig, SFTTrainer
-    from unsloth import FastLanguageModel
-    from unsloth.chat_templates import get_chat_template, standardize_data_formats, train_on_responses_only
 
     if args.hf_token_env and os.environ.get(args.hf_token_env):
         os.environ.setdefault("HF_TOKEN", os.environ[args.hf_token_env])
@@ -211,28 +273,10 @@ def train(args: argparse.Namespace) -> None:
     if eval_dataset is not None:
         eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
 
-    training_args = SFTConfig(
-        output_dir=str(args.output_dir),
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        packing=args.packing,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        optim=args.optim,
-        weight_decay=args.weight_decay,
-        lr_scheduler_type=args.lr_scheduler_type,
-        seed=args.seed,
-        report_to=args.report_to,
-    )
+    training_args = make_sft_config(SFTConfig, args)
 
-    trainer = SFTTrainer(
+    trainer = make_sft_trainer(
+        SFTTrainer,
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
