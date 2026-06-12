@@ -10,6 +10,8 @@ output directory from `generate_ssd_dataset.py`, or a folder of split
 - `train_qwen_lora.py` - Unsloth LoRA fine-tuning entrypoint.
 - `merge_qwen_lora.py` - optional post-training merge/export entrypoint.
 - `validate_training_data.py` - dependency-free JSONL sanity check.
+- `prepare_code_only_sft.py` - strips thinking/prose/fences from generated
+  records and writes code-only SFT chunks.
 - `export_training_metrics.py` - export loss history from checkpoints.
 - `requirements-a5000.txt` - minimal Python packages to install in a CUDA venv.
 
@@ -52,13 +54,29 @@ Keep Hugging Face credentials out of notebooks and scripts:
 export HF_TOKEN=...
 ```
 
+## Prepare Code-Only Data
+
+The raw generated sample originally contained Qwen thinking traces and prose.
+Do not train on that directly for LiveCodeBench accuracy. Build code-only
+targets first:
+
+```bash
+python training/prepare_code_only_sft.py \
+  --data-path training/sft_messages \
+  --output-dir training/sft_code_only
+```
+
+This writes chunks under `training/sft_code_only/sft_messages/`, replaces the
+system prompt with a code-only instruction, extracts the final Python code block,
+and skips records that still look like prose after cleaning.
+
 ## Validate Data
 
 From the repository root:
 
 ```bash
 python training/validate_training_data.py \
-  --data-path training/sft_messages
+  --data-path training/sft_code_only
 ```
 
 For the future single-file handoff:
@@ -74,7 +92,7 @@ This runs on only a few local records and writes a disposable adapter folder.
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_messages \
+  --data-path training/sft_code_only \
   --limit-records 3 \
   --max-steps 2 \
   --save-steps 1 \
@@ -83,28 +101,35 @@ python training/train_qwen_lora.py \
 
 ## Full Training Run
 
-The defaults mirror the Colab notebook: Qwen3-4B, 4-bit loading, LoRA rank 32,
-sequence length 2048, batch size 2, gradient accumulation 4, response-only
-training, and no automatic Hub push.
+The defaults use Qwen3-4B, 4-bit loading, LoRA rank 32, sequence length 2048,
+batch size 2, gradient accumulation 4, response-only training, a conservative
+LoRA learning rate of `2e-5`, and no automatic Hub push. For serious runs, pass
+the context length explicitly instead of relying on defaults.
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path /path/to/records.jsonl \
+  --data-path training/sft_code_only \
   --output-dir training_outputs/qwen3_4b_lora \
-  --max-steps 60
+  --max-steps -1 \
+  --num-train-epochs 1 \
+  --learning-rate 2e-5
 ```
 
-The attached split `training/sft_messages` sample validates as 1005 records.
-Many assistant responses are long, so use `validate_training_data.py` to inspect
-lengths before picking a context length. On the A5000, start with a smoke test at
-2048, then try a larger context with smaller batch size if VRAM allows:
+The raw split `training/sft_messages` has 1005 records, but it contains thinking
+traces. The prepared split `training/sft_code_only` has 979 code-only records.
+Use `validate_training_data.py` to inspect lengths before picking a context
+length. On the A5000, start with a smoke test, then try a larger context with
+smaller batch size if VRAM allows:
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_messages \
-  --max-seq-length 4096 \
+  --data-path training/sft_code_only \
+  --max-seq-length 32768 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \
+  --learning-rate 2e-5 \
+  --max-steps -1 \
+  --num-train-epochs 1 \
   --output-dir training_outputs/qwen3_4b_lora
 ```
 

@@ -23,8 +23,9 @@ DEFAULT_OUTPUT_DIR = Path("ssd_qwen3_4b_lcb_dataset")
 DEFAULT_MLX_MODEL = "/Users/aayanarish/models/Qwen3-4B-4bit"
 DEFAULT_CHUNK_SIZE = 100
 DEFAULT_SYSTEM_PROMPT = (
-    "You are an expert competitive programmer. Solve the problem in Python "
-    "and provide the final answer as a markdown code block."
+    "You are an expert competitive programmer. Return only a complete Python 3 "
+    "solution. Do not include explanations, reasoning, markdown fences, or any "
+    "text outside the code."
 )
 
 
@@ -319,19 +320,53 @@ def read_skip_keys(skipped_path: Path) -> tuple[set[str], set[str], dict[str, in
     return skip_keys, finalized_ids, reason_counts
 
 
-def build_messages(system_prompt: str, prompt_text: str) -> list[dict[str, str]]:
+def strip_thinking_blocks(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?think>\s*", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def extract_code_block(text: str) -> str | None:
+    matches = list(
+        re.finditer(
+            r"```(?:python|py|Python)?[ \t]*\n(.*?)```",
+            text,
+            flags=re.DOTALL,
+        )
+    )
+    if not matches:
+        return None
+    return matches[-1].group(1).strip()
+
+
+def code_only_output(text: str) -> str:
+    text = strip_thinking_blocks(text)
+    code = extract_code_block(text)
+    return code if code is not None else text.strip()
+
+
+def build_messages(system_prompt: str, prompt_text: str, no_think_suffix: bool) -> list[dict[str, str]]:
+    if no_think_suffix:
+        prompt_text = prompt_text.rstrip() + "\n\n/no_think"
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt_text},
     ]
 
 
-def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]]) -> str:
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool) -> str:
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            enable_thinking=enable_thinking,
+            **kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def encode_len(tokenizer: Any, text: str) -> int:
@@ -538,6 +573,9 @@ def make_manifest(
             "top_k": args.top_k,
             "top_p": args.top_p,
             "system_prompt": args.system_prompt,
+            "enable_thinking": args.enable_thinking,
+            "no_think_suffix": args.no_think_suffix,
+            "code_only_sft": args.code_only_sft,
             "paper_minimal_filtering": True,
             "no_correctness_verification": True,
             "no_code_execution": True,
@@ -678,8 +716,8 @@ def run_generation(args: argparse.Namespace) -> None:
             if candidate.id in completed_ids or candidate.id in finalized_skipped_ids:
                 continue
 
-            messages = build_messages(args.system_prompt, candidate.prompt_text)
-            prompt = apply_chat_template(tokenizer, messages)
+            messages = build_messages(args.system_prompt, candidate.prompt_text, args.no_think_suffix)
+            prompt = apply_chat_template(tokenizer, messages, args.enable_thinking)
             prompt_tokens = encode_len(tokenizer, prompt)
             max_new_tokens = args.max_context_tokens - prompt_tokens
 
@@ -723,7 +761,8 @@ def run_generation(args: argparse.Namespace) -> None:
                 json_dump_line(skipped_handle, skip)
                 continue
 
-            output_text = generation.text.strip()
+            raw_output_text = generation.text.strip()
+            output_text = code_only_output(raw_output_text) if args.code_only_sft else raw_output_text
             output_tokens = encode_len(tokenizer, output_text)
             total_tokens = prompt_tokens + output_tokens
 
@@ -782,6 +821,8 @@ def run_generation(args: argparse.Namespace) -> None:
                 "finish_reason": generation.finish_reason,
                 "elapsed_seconds": round(time.time() - start, 3),
             }
+            if raw_output_text != output_text:
+                record["raw_assistant_content"] = raw_output_text
             write_accepted_chunk(
                 args.output_dir,
                 current_chunk_index,
@@ -904,6 +945,24 @@ def parse_args() -> argparse.Namespace:
         help="Allow custom model code when loading the generation model.",
     )
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass enable_thinking to chat templates that support it.",
+    )
+    parser.add_argument(
+        "--no-think-suffix",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append /no_think to the user message for Qwen3-style models.",
+    )
+    parser.add_argument(
+        "--code-only-sft",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Strip thinking blocks and markdown fences before writing SFT targets.",
+    )
     parser.add_argument("--max-context-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.6)
     parser.add_argument("--top-k", type=int, default=20)

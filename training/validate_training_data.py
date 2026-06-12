@@ -7,6 +7,7 @@ import argparse
 import json
 import statistics
 import sys
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,9 @@ def validate(path: Path, prefer_records: bool) -> dict[str, Any]:
     role_counts: dict[str, int] = {}
     user_lengths: list[int] = []
     assistant_lengths: list[int] = []
+    thinking_markers = 0
+    markdown_fences = 0
+    possible_prose = 0
     count = 0
 
     for file_path in files:
@@ -31,7 +35,14 @@ def validate(path: Path, prefer_records: bool) -> dict[str, Any]:
                 for message in messages:
                     role_counts[message["role"]] = role_counts.get(message["role"], 0) + 1
                 user_lengths.append(len(messages[-2]["content"]))
-                assistant_lengths.append(len(messages[-1]["content"]))
+                assistant = messages[-1]["content"]
+                assistant_lengths.append(len(assistant))
+                if "<think" in assistant.lower() or "</think" in assistant.lower():
+                    thinking_markers += 1
+                if "```" in assistant:
+                    markdown_fences += 1
+                if looks_like_prose(assistant):
+                    possible_prose += 1
 
     if count == 0:
         raise ValueError("No records found")
@@ -45,6 +56,11 @@ def validate(path: Path, prefer_records: bool) -> dict[str, Any]:
             [user + assistant for user, assistant in zip(user_lengths, assistant_lengths)]
         ),
         "assistant_characters": length_summary(assistant_lengths),
+        "assistant_quality": {
+            "thinking_marker_records": thinking_markers,
+            "markdown_fence_records": markdown_fences,
+            "possible_prose_records": possible_prose,
+        },
     }
 
 
@@ -67,6 +83,19 @@ def percentile(values: list[int], q: float) -> float:
     upper = min(lower + 1, len(sorted_values) - 1)
     fraction = position - lower
     return sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction
+
+
+def looks_like_prose(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", text.lower())
+    prose_markers = [
+        "### explanation",
+        "explanation:",
+        "the code",
+        "this solution",
+        "we need",
+        "let's",
+    ]
+    return any(marker in lowered for marker in prose_markers)
 
 
 def parse_args() -> argparse.Namespace:

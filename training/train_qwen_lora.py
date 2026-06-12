@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_MODEL = "unsloth/Qwen3-4B-Instruct-2507"
-DEFAULT_DATA_PATH = Path("training/sft_messages")
+DEFAULT_DATA_PATH = Path("training/sft_code_only")
 DEFAULT_OUTPUT_DIR = Path("training_outputs/qwen3_4b_lora")
 DEFAULT_CHAT_TEMPLATE = "qwen3-instruct"
 RESPONSE_MARKER = "<|im_start|>assistant\n"
@@ -340,7 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=60)
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--logging-steps", type=positive_int, default=1)
     parser.add_argument("--save-steps", type=positive_int, default=25)
     parser.add_argument("--save-total-limit", type=positive_int, default=2)
