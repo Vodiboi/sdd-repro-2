@@ -6,10 +6,9 @@ asks Qwen3-4B to generate one Python solution per unique prompt, and writes
 chat-format JSONL that can be used for supervised fine-tuning.
 
 The implementation follows the dataset-generation portion of the SSD paper's
-recipe in spirit: sample model outputs, avoid correctness verification, and
-avoid code execution. For this reproduction, the SFT handoff is intentionally
-code-only so Qwen thinking traces and explanations do not become training
-targets.
+recipe: sample model outputs, write the sampled assistant text unchanged, avoid
+correctness verification, avoid code execution, and do not parse or filter the
+assistant output.
 
 ## Repository Contents
 
@@ -85,8 +84,8 @@ The default script settings are:
 - top-p: `0.8`
 - Qwen thinking: disabled by default (`enable_thinking=False` when supported,
   plus `/no_think` suffix)
-- SFT target cleanup: strip thinking blocks and markdown fences by default
-- filtering: skip empty outputs and single-line stubs only
+- filtering: no parsing, no code extraction, and no one-line stub filtering by
+  default; empty outputs are skipped because they cannot form valid chat records
 - verification: no test execution and no correctness filtering
 
 The dataset is audited before generation. Empty prompts are skipped, and

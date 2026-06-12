@@ -10,8 +10,6 @@ output directory from `generate_ssd_dataset.py`, or a folder of split
 - `train_qwen_lora.py` - Unsloth LoRA fine-tuning entrypoint.
 - `merge_qwen_lora.py` - optional post-training merge/export entrypoint.
 - `validate_training_data.py` - dependency-free JSONL sanity check.
-- `prepare_code_only_sft.py` - strips thinking/prose/fences from generated
-  records and writes code-only SFT chunks.
 - `export_training_metrics.py` - export loss history from checkpoints.
 - `requirements-a5000.txt` - minimal Python packages to install in a CUDA venv.
 
@@ -54,21 +52,17 @@ Keep Hugging Face credentials out of notebooks and scripts:
 export HF_TOKEN=...
 ```
 
-## Prepare Code-Only Data
+## Regenerate Data
 
-The raw generated sample originally contained Qwen thinking traces and prose.
-Do not train on that directly for LiveCodeBench accuracy. Build code-only
-targets first:
+The checked-in `training/sft_messages` sample is useful only for tiny script
+smoke tests: it contains Qwen thinking traces from the earlier generation
+prompt. For the actual run, regenerate the SSD records with the current
+`generate_ssd_dataset.py` defaults. Those defaults ask for code only, append
+`/no_think`, pass `enable_thinking=False` to compatible Qwen chat templates, and
+write the sampled assistant output unchanged.
 
-```bash
-python training/prepare_code_only_sft.py \
-  --data-path training/sft_messages \
-  --output-dir training/sft_code_only
-```
-
-This writes chunks under `training/sft_code_only/sft_messages/`, replaces the
-system prompt with a code-only instruction, extracts the final Python code block,
-and skips records that still look like prose after cleaning.
+Do not parse, strip, or extract the assistant output before training if you want
+the workflow to match the SSD setup.
 
 ## Validate Data
 
@@ -76,7 +70,7 @@ From the repository root:
 
 ```bash
 python training/validate_training_data.py \
-  --data-path training/sft_code_only
+  --data-path training/sft_messages
 ```
 
 For the future single-file handoff:
@@ -92,7 +86,7 @@ This runs on only a few local records and writes a disposable adapter folder.
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_code_only \
+  --data-path training/sft_messages \
   --limit-records 3 \
   --max-steps 2 \
   --save-steps 1 \
@@ -108,22 +102,20 @@ the context length explicitly instead of relying on defaults.
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_code_only \
+  --data-path /path/to/new_raw_no_think_records \
   --output-dir training_outputs/qwen3_4b_lora \
   --max-steps -1 \
   --num-train-epochs 1 \
   --learning-rate 2e-5
 ```
 
-The raw split `training/sft_messages` has 1005 records, but it contains thinking
-traces. The prepared split `training/sft_code_only` has 979 code-only records.
-Use `validate_training_data.py` to inspect lengths before picking a context
-length. On the A5000, start with a smoke test, then try a larger context with
-smaller batch size if VRAM allows:
+Use `validate_training_data.py` to inspect lengths and contamination markers
+before picking a context length. On the A5000, start with a smoke test, then try
+a larger context with smaller batch size if VRAM allows:
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_code_only \
+  --data-path /path/to/new_raw_no_think_records \
   --max-seq-length 32768 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 8 \

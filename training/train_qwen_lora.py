@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_MODEL = "unsloth/Qwen3-4B-Instruct-2507"
-DEFAULT_DATA_PATH = Path("training/sft_code_only")
+DEFAULT_DATA_PATH = Path("training/sft_messages")
 DEFAULT_OUTPUT_DIR = Path("training_outputs/qwen3_4b_lora")
 DEFAULT_CHAT_TEMPLATE = "qwen3-instruct"
 RESPONSE_MARKER = "<|im_start|>assistant\n"

@@ -24,8 +24,8 @@ DEFAULT_MLX_MODEL = "/Users/aayanarish/models/Qwen3-4B-4bit"
 DEFAULT_CHUNK_SIZE = 100
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert competitive programmer. Return only a complete Python 3 "
-    "solution. Do not include explanations, reasoning, markdown fences, or any "
-    "text outside the code."
+    "solution. Do not include explanations, reasoning, thinking, markdown fences, "
+    "or any text outside the code."
 )
 
 
@@ -320,31 +320,6 @@ def read_skip_keys(skipped_path: Path) -> tuple[set[str], set[str], dict[str, in
     return skip_keys, finalized_ids, reason_counts
 
 
-def strip_thinking_blocks(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"</?think>\s*", "", text, flags=re.IGNORECASE)
-    return text.strip()
-
-
-def extract_code_block(text: str) -> str | None:
-    matches = list(
-        re.finditer(
-            r"```(?:python|py|Python)?[ \t]*\n(.*?)```",
-            text,
-            flags=re.DOTALL,
-        )
-    )
-    if not matches:
-        return None
-    return matches[-1].group(1).strip()
-
-
-def code_only_output(text: str) -> str:
-    text = strip_thinking_blocks(text)
-    code = extract_code_block(text)
-    return code if code is not None else text.strip()
-
-
 def build_messages(system_prompt: str, prompt_text: str, no_think_suffix: bool) -> list[dict[str, str]]:
     if no_think_suffix:
         prompt_text = prompt_text.rstrip() + "\n\n/no_think"
@@ -575,8 +550,7 @@ def make_manifest(
             "system_prompt": args.system_prompt,
             "enable_thinking": args.enable_thinking,
             "no_think_suffix": args.no_think_suffix,
-            "code_only_sft": args.code_only_sft,
-            "paper_minimal_filtering": True,
+            "filter_single_line_stubs": args.filter_single_line_stubs,
             "no_correctness_verification": True,
             "no_code_execution": True,
             "seed": args.seed,
@@ -761,12 +735,11 @@ def run_generation(args: argparse.Namespace) -> None:
                 json_dump_line(skipped_handle, skip)
                 continue
 
-            raw_output_text = generation.text.strip()
-            output_text = code_only_output(raw_output_text) if args.code_only_sft else raw_output_text
+            output_text = generation.text.strip()
             output_tokens = encode_len(tokenizer, output_text)
             total_tokens = prompt_tokens + output_tokens
 
-            if not output_text or is_single_line_stub(output_text):
+            if not output_text or (args.filter_single_line_stubs and is_single_line_stub(output_text)):
                 reason = "filtered_empty_output" if not output_text else "filtered_single_line_stub"
                 skip = {
                     "_skip_key": f"{reason}:{candidate.id}",
@@ -821,8 +794,6 @@ def run_generation(args: argparse.Namespace) -> None:
                 "finish_reason": generation.finish_reason,
                 "elapsed_seconds": round(time.time() - start, 3),
             }
-            if raw_output_text != output_text:
-                record["raw_assistant_content"] = raw_output_text
             write_accepted_chunk(
                 args.output_dir,
                 current_chunk_index,
@@ -957,16 +928,16 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Append /no_think to the user message for Qwen3-style models.",
     )
-    parser.add_argument(
-        "--code-only-sft",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Strip thinking blocks and markdown fences before writing SFT targets.",
-    )
     parser.add_argument("--max-context-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.6)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument(
+        "--filter-single-line-stubs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optionally skip one-line generations. Defaults off to keep raw outputs.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--chunk-size",
