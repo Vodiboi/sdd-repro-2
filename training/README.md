@@ -10,6 +10,7 @@ output directory from `generate_ssd_dataset.py`, or a folder of split
 - `train_qwen_lora.py` - Unsloth LoRA fine-tuning entrypoint.
 - `merge_qwen_lora.py` - optional post-training merge/export entrypoint.
 - `validate_training_data.py` - dependency-free JSONL sanity check.
+- `export_training_metrics.py` - export loss history from checkpoints.
 - `requirements-a5000.txt` - minimal Python packages to install in a CUDA venv.
 
 ## Data Input
@@ -118,6 +119,24 @@ python training/train_qwen_lora.py \
   --data-path /path/to/records.jsonl \
   --output-dir training_outputs/qwen3_4b_lora \
   --resume-from-checkpoint training_outputs/qwen3_4b_lora/checkpoint-25
+```
+
+## Metrics
+
+Trainer checkpoints include `trainer_state.json`, which stores `log_history`
+entries such as loss, learning rate, gradient norm, step, and epoch. Export them
+without touching the training tmux session:
+
+```bash
+python training/export_training_metrics.py \
+  --output-dir training_outputs/qwen3_4b_lora
+```
+
+The exporter writes:
+
+```text
+training_outputs/qwen3_4b_lora/metrics/training_metrics.csv
+training_outputs/qwen3_4b_lora/metrics/loss.png
 ```
 
 ## Merge Or Export
