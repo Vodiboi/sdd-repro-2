@@ -54,15 +54,18 @@ export HF_TOKEN=...
 
 ## Regenerate Data
 
-The checked-in `training/sft_messages` sample is useful only for tiny script
-smoke tests: it contains Qwen thinking traces from the earlier generation
-prompt. For the actual run, regenerate the SSD records with the current
-`generate_ssd_dataset.py` defaults. Those defaults ask for code only, append
-`/no_think`, pass `enable_thinking=False` to compatible Qwen chat templates, and
-write the sampled assistant output unchanged.
+The checked-in `training/sft_messages` sample is contaminated with Qwen
+thinking traces from the earlier generation prompt. Do not train on it. For the
+actual run, regenerate the SSD records with the current `generate_ssd_dataset.py`
+defaults. Those defaults ask for code only, append `/no_think`, pass
+`enable_thinking=False` to compatible Qwen chat templates, and write the sampled
+assistant output unchanged.
 
 Do not parse, strip, or extract the assistant output before training if you want
 the workflow to match the SSD setup.
+
+The trainer refuses to run on assistant targets containing `<think>` by default.
+Only pass `--allow-thinking-targets` for an intentional diagnostic run.
 
 ## Validate Data
 
@@ -70,7 +73,7 @@ From the repository root:
 
 ```bash
 python training/validate_training_data.py \
-  --data-path training/sft_messages
+  --data-path ssd_qwen3_4b_raw_no_think
 ```
 
 For the future single-file handoff:
@@ -86,7 +89,7 @@ This runs on only a few local records and writes a disposable adapter folder.
 
 ```bash
 python training/train_qwen_lora.py \
-  --data-path training/sft_messages \
+  --data-path ssd_qwen3_4b_raw_no_think \
   --limit-records 3 \
   --max-steps 2 \
   --save-steps 1 \

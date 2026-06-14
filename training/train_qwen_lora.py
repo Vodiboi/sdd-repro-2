@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_MODEL = "unsloth/Qwen3-4B-Instruct-2507"
-DEFAULT_DATA_PATH = Path("training/sft_messages")
+DEFAULT_DATA_PATH = Path("ssd_qwen3_4b_raw_no_think")
 DEFAULT_OUTPUT_DIR = Path("training_outputs/qwen3_4b_lora")
 DEFAULT_CHAT_TEMPLATE = "qwen3-instruct"
 RESPONSE_MARKER = "<|im_start|>assistant\n"
@@ -106,14 +106,31 @@ def normalize_messages(record: dict[str, Any], source: Path, index: int) -> list
     return normalized
 
 
-def load_chat_records(paths: list[Path], limit: int | None, seed: int) -> list[dict[str, Any]]:
+def load_chat_records(
+    paths: list[Path],
+    limit: int | None,
+    seed: int,
+    allow_thinking_targets: bool,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    thinking_examples: list[str] = []
     for path in paths:
         for index, record in enumerate(iter_jsonl(path), start=1):
-            rows.append({"conversations": normalize_messages(record, path, index)})
+            messages = normalize_messages(record, path, index)
+            assistant = messages[-1]["content"].lower()
+            if "<think" in assistant or "</think" in assistant:
+                thinking_examples.append(f"{path}:{index}")
+            rows.append({"conversations": messages})
 
     if not rows:
         raise ValueError("No training records were loaded")
+    if thinking_examples and not allow_thinking_targets:
+        preview = ", ".join(thinking_examples[:5])
+        raise ValueError(
+            "Training data contains assistant <think> targets. Refusing to train. "
+            "Regenerate with the raw no-thinking generator output, or pass "
+            f"--allow-thinking-targets if this is intentional. Examples: {preview}"
+        )
 
     random.Random(seed).shuffle(rows)
     if limit is not None:
@@ -225,18 +242,18 @@ def make_sft_trainer(
 
 
 def train(args: argparse.Namespace) -> None:
+    if args.hf_token_env and os.environ.get(args.hf_token_env):
+        os.environ.setdefault("HF_TOKEN", os.environ[args.hf_token_env])
+
+    data_paths = jsonl_files_from_path(args.data_path, prefer_sft=not args.prefer_records)
+    rows = load_chat_records(data_paths, args.limit_records, args.seed, args.allow_thinking_targets)
+    train_rows, eval_rows = split_rows(rows, args.eval_fraction, args.seed)
+
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import get_chat_template, standardize_data_formats, train_on_responses_only
     import torch
     from datasets import Dataset
     from trl import SFTConfig, SFTTrainer
-
-    if args.hf_token_env and os.environ.get(args.hf_token_env):
-        os.environ.setdefault("HF_TOKEN", os.environ[args.hf_token_env])
-
-    data_paths = jsonl_files_from_path(args.data_path, prefer_sft=not args.prefer_records)
-    rows = load_chat_records(data_paths, args.limit_records, args.seed)
-    train_rows, eval_rows = split_rows(rows, args.eval_fraction, args.seed)
 
     print(f"Using data files: {[str(path) for path in data_paths]}")
     print(f"Loaded {len(rows)} records; train={len(train_rows)}, eval={len(eval_rows or [])}")
@@ -316,6 +333,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit-records", type=positive_int, default=None)
     parser.add_argument("--eval-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--allow-thinking-targets",
+        action="store_true",
+        help="Allow assistant targets containing <think>. Defaults off to prevent accidental contaminated training.",
+    )
 
     parser.add_argument("--model-name", default=DEFAULT_MODEL)
     parser.add_argument("--chat-template", default=DEFAULT_CHAT_TEMPLATE)
